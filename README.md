@@ -3,6 +3,7 @@
 | Front | Back |
 | --- | --- |
 | <img src="images/front.jpeg" alt="KaniOS device - front" width="420" /> | <img src="images/back.jpeg" alt="KaniOS device - back" width="420" /> |
+
 *im not using any rf anntenna because im not done implementing it.. :)
 
 
