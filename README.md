@@ -91,7 +91,7 @@ Pastikan kamu telah menginstal *library* berikut di Arduino IDE atau PlatformIO 
 
 3. **Kompilasi dan Upload Kode:**
    - Pilih board ESP32 yang kamu gunakan di Arduino IDE.
-   - Karena programnya cukup besar, atur skema partisi minimal ke **Huge APP (3MB No OTA / 1MB SPIFFS)**.
+   - Karena programnya cukup besar, atur skema partisi minimal ke **No OTA (2MB APP / 2MB SPIFFS)**.
    - Klik **Upload**.
 
 4. **Setup Awal (WiFi):**
