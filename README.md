@@ -100,15 +100,12 @@ Install these libraries in Arduino IDE or PlatformIO before compiling:
    cd KaniOS
    ```
 
-2. **Prepare Internal Storage (LittleFS):**  
-   The system needs a filesystem for images, configs, and notes. Use the **ESP32 LittleFS Data Upload** plugin in Arduino IDE to upload the `data/` folder to the ESP32 flash.
-
-3. **Compile and Upload the Code:**
+2. **Compile and Upload the Code:**
    - Select your ESP32 board in Arduino IDE.
    - Since the program is large, set the partition scheme to at least **No OTA (2MB APP / 2MB SPIFFS)**.
    - Click **Upload**.
 
-4. **First-Time WiFi Setup:**
+3. **First-Time WiFi Setup:**
    - Power on the device. If WiFi credentials are empty, it will create an Access Point named **Ripa-Setup**.
    - Connect your phone/PC to that AP and open **192.168.4.1** in a browser.
    - Enter your local WiFi name and password, then save. The ESP32 will reboot automatically and enter the KaniOS main interface.
